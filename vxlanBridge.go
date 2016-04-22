@@ -79,6 +79,7 @@ type Vlan struct {
 }
 
 const METADATA_RX_VTEP = 0x1
+const VXLAN_GARP_SUPPORTED = false
 
 // Create a new vxlan instance
 func NewVxlan(agent *OfnetAgent, rpcServ *rpc.Server) *Vxlan {
@@ -162,11 +163,17 @@ func (self *Vxlan) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 		return err
 	}
 
-	// Set source endpoint group if specified
+	vrfid := self.agent.vrfNameIdMap[endpoint.Vrf]
+	//set vrf id as METADATA
+	metadata, metadataMask := Vrfmetadata(*vrfid)
+
 	if endpoint.EndpointGroup != 0 {
-		metadata, metadataMask := SrcGroupMetadata(endpoint.EndpointGroup)
-		portVlanFlow.SetMetadata(metadata, metadataMask)
+		srcMetadata, srcMetadataMask := SrcGroupMetadata(endpoint.EndpointGroup)
+		metadata = metadata | srcMetadata
+		metadataMask = metadataMask | srcMetadataMask
+
 	}
+	portVlanFlow.SetMetadata(metadata, metadataMask)
 
 	// Set the vlan and install it
 	portVlanFlow.SetVlan(endpoint.Vlan)
@@ -221,11 +228,19 @@ func (self *Vxlan) AddLocalEndpoint(endpoint OfnetEndpoint) error {
 	// Save the flow in DB
 	self.macFlowDb[endpoint.MacAddrStr] = macFlow
 
+	// Send GARP
+	err = self.sendGARP(endpoint.IpAddr, macAddr, uint64(endpoint.Vni))
+	if err != nil {
+		log.Warnf("Error in sending GARP packet for (%s,%s) in vlan %d. Err: %+v",
+			endpoint.IpAddr.String(), endpoint.MacAddrStr, endpoint.Vlan, err)
+	}
+
 	return nil
 }
 
 // Remove local endpoint
 func (self *Vxlan) RemoveLocalEndpoint(endpoint OfnetEndpoint) error {
+	log.Infof("Received Remove local endpont {%v}", endpoint)
 	// Remove the port from flood lists
 	vlanId := self.agent.vniVlanMap[endpoint.Vni]
 	vlan := self.vlanDb[*vlanId]
@@ -286,9 +301,17 @@ func (self *Vxlan) AddVtepPort(portNo uint32, remoteIp net.IP) error {
 			return err
 		}
 		portVlanFlow.SetVlan(*vlan)
-
 		// Set the metadata to indicate packet came in from VTEP port
-		portVlanFlow.SetMetadata(METADATA_RX_VTEP, METADATA_RX_VTEP)
+
+		vrf := self.agent.vlanVrf[*vlan]
+		vrfid := self.agent.vrfNameIdMap[*vrf]
+		//set vrf id as METADATA
+		vrfmetadata, vrfmetadataMask := Vrfmetadata(*vrfid)
+
+		metadata := METADATA_RX_VTEP | vrfmetadata
+		metadataMask := METADATA_RX_VTEP | vrfmetadataMask
+
+		portVlanFlow.SetMetadata(metadata, metadataMask)
 
 		// Point to next table
 		// Note that we bypass policy lookup on dest host.
@@ -340,8 +363,10 @@ func (self *Vxlan) RemoveVtepPort(portNo uint32, remoteIp net.IP) error {
 }
 
 // Add a vlan.
-func (self *Vxlan) AddVlan(vlanId uint16, vni uint32) error {
+func (self *Vxlan) AddVlan(vlanId uint16, vni uint32, vrf string) error {
 	var err error
+	self.agent.vlanVrf[vlanId] = &vrf
+	self.agent.createVrf(vrf)
 	// check if the vlan already exists. if it does, we are done
 	if self.vlanDb[vlanId] != nil {
 		return nil
@@ -381,7 +406,15 @@ func (self *Vxlan) AddVlan(vlanId uint16, vni uint32) error {
 		portVlanFlow.SetVlan(vlanId)
 
 		// Set the metadata to indicate packet came in from VTEP port
-		portVlanFlow.SetMetadata(METADATA_RX_VTEP, METADATA_RX_VTEP)
+		vrf := self.agent.vlanVrf[vlanId]
+		vrfid := self.agent.vrfNameIdMap[*vrf]
+		//set vrf id as METADATA
+		vrfmetadata, vrfmetadataMask := Vrfmetadata(*vrfid)
+
+		metadata := METADATA_RX_VTEP | vrfmetadata
+		metadataMask := METADATA_RX_VTEP | vrfmetadataMask
+
+		portVlanFlow.SetMetadata(metadata, metadataMask)
 
 		// Point to next table
 		// Note that we pypass policy lookup on dest host
@@ -426,21 +459,26 @@ func (self *Vxlan) AddVlan(vlanId uint16, vni uint32) error {
 		Metadata:     &metadataVtepRx,
 		MetadataMask: &metadataVtepRx,
 	})
+
 	if err != nil {
 		log.Errorf("Error creating local flood. Err: %v", err)
 		return err
 	}
+
 	vtepMacMiss.Next(vlan.localFlood)
 	vlan.vtepMacMiss = vtepMacMiss
 
 	// store it in DB
 	self.vlanDb[vlanId] = vlan
 
+	self.agent.vlanVrf[vlanId] = &vrf
+	self.agent.createVrf(vrf)
 	return nil
 }
 
 // Remove a vlan
-func (self *Vxlan) RemoveVlan(vlanId uint16, vni uint32) error {
+func (self *Vxlan) RemoveVlan(vlanId uint16, vni uint32, vrf string) error {
+
 	vlan := self.vlanDb[vlanId]
 	if vlan == nil {
 		log.Fatalf("Could not find the vlan %d", vlanId)
@@ -468,7 +506,8 @@ func (self *Vxlan) RemoveVlan(vlanId uint16, vni uint32) error {
 
 	// Remove it from DB
 	delete(self.vlanDb, vlanId)
-
+	delete(self.agent.vlanVrf, vlanId)
+	self.agent.deleteVrf(vrf)
 	return nil
 }
 
@@ -680,9 +719,21 @@ func (self *Vxlan) processArp(pkt protocol.Ethernet, inPort uint32) {
 
 		switch arpIn.Operation {
 		case protocol.Type_Request:
+			// If it's a GARP packet, ignore processing
+			if arpIn.IPSrc.String() == arpIn.IPDst.String() {
+				log.Debugf("Ignoring GARP packet")
+				return
+			}
+
+                        if self.agent.portVlanMap[inPort] == nil{
+                            log.Debugf("Invalid port vlan mapping. Ignoring arp packet")
+                            return
+                        }
+                        vlan := self.agent.portVlanMap[inPort]
+                           
 			// Lookup the Source and Dest IP in the endpoint table
-			srcEp := self.agent.getEndpointByIp(arpIn.IPSrc)
-			dstEp := self.agent.getEndpointByIp(arpIn.IPDst)
+			srcEp := self.agent.getEndpointByIpVlan(arpIn.IPSrc, *vlan)
+			dstEp := self.agent.getEndpointByIpVlan(arpIn.IPDst, *vlan)
 
 			// No information about the src or dest EP. Ignore processing.
 			if srcEp == nil && dstEp == nil {
@@ -788,4 +839,30 @@ func (self *Vxlan) processArp(pkt protocol.Ethernet, inPort uint32) {
 			self.ofSwitch.Send(pktOut)
 		}
 	}
+}
+
+// sendGARP sends GARP for the specified IP, MAC
+func (self *Vxlan) sendGARP(ip net.IP, mac net.HardwareAddr, vni uint64) error {
+
+	// NOTE: Enable this when EVPN support is added.
+	if !VXLAN_GARP_SUPPORTED {
+		return nil
+	}
+
+	pktOut := BuildGarpPkt(ip, mac, 0)
+
+	tunnelIdField := openflow13.NewTunnelIdField(vni)
+	setTunnelAction := openflow13.NewActionSetField(*tunnelIdField)
+
+	// Add set tunnel action to the instruction
+	pktOut.AddAction(setTunnelAction)
+
+	for _, vtepPort := range self.agent.vtepTable {
+		log.Debugf("Sending to Vtep port: %+v", *vtepPort)
+		pktOut.AddAction(openflow13.NewActionOutput(*vtepPort))
+	}
+
+	// Send it out
+	self.ofSwitch.Send(pktOut)
+	return nil
 }
