@@ -95,6 +95,7 @@ func (vl *VlanBridge) PacketRcvd(sw *ofctrl.OFSwitch, pkt *ofctrl.PacketIn) {
 	if pkt.TableId == SRV_PROXY_SNAT_TBL_ID || pkt.TableId == SRV_PROXY_DNAT_TBL_ID {
 		// these are destined to service proxy
 		vl.svcProxy.HandlePkt(pkt)
+		return
 	}
 
 	switch pkt.Data.Ethertype {
