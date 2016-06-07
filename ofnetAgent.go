@@ -357,6 +357,12 @@ func (self *OfnetAgent) RemoveMaster(masterInfo *OfnetNode) error {
 	return nil
 }
 
+// InjectGARPs inject garps for all eps on the epg.
+func (self *OfnetAgent) InjectGARPs(epgID int, resp *bool) error {
+	self.datapath.InjectGARPs(epgID)
+	return nil
+}
+
 // Add a local endpoint.
 // This takes ofp port number, mac address, vlan , VrfId and IP address of the port.
 func (self *OfnetAgent) AddLocalEndpoint(endpoint EndpointInfo) error {
