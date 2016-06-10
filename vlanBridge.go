@@ -33,7 +33,8 @@ import (
 // This is mostly stub code.
 
 const (
-	GARPRepeats = 10
+	GARPRepeats = 15
+	GARPDELAY   = 3
 )
 
 // VlanBridge has Vlan state.
@@ -145,19 +146,28 @@ func (vl *VlanBridge) backGroundGARPs() {
 		vl.garpMutex.Lock()
 
 		workDone := false
-		for _, epgInfo := range vl.epgToEPs {
+		for epgID, epgInfo := range vl.epgToEPs {
 			if epgInfo.garpCount <= 0 {
-				break
+				continue
 			}
 
+			stats, ok := vl.agent.GARPStats[epgID]
+			if !ok {
+				stats = 0
+			}
 			epgInfo.garpCount--
 			for _, ep := range epgInfo.epMap {
 				err := vl.sendGARP(ep.ip, ep.mac, ep.vlan)
-				if err != nil {
+				if err == nil {
+					stats++
+				} else {
 					log.Warnf("Send GARP failed for ep IP: %v", ep.ip)
 				}
 				workDone = true
 			}
+
+			vl.agent.GARPStats[epgID] = stats
+			vl.epgToEPs[epgID] = epgInfo
 		}
 
 		if !workDone { // No epgs pending. Time to exit
@@ -167,7 +177,7 @@ func (vl *VlanBridge) backGroundGARPs() {
 		}
 
 		vl.garpMutex.Unlock()
-		time.Sleep(time.Second)
+		time.Sleep(GARPDELAY * time.Second)
 	}
 }
 
